@@ -212,17 +212,49 @@ def require_google_service(
 
         # Create a new signature for the wrapper that excludes the 'service' parameter.
         # This is the signature that FastMCP will see.
-        wrapper_sig = original_sig.replace(parameters=params[1:])
+        # Also inject OAuth parameters if they don't already exist
+        wrapper_params = list(params[1:])  # Exclude 'service' parameter
+        
+        # Check if OAuth parameters already exist
+        param_names = [p.name for p in wrapper_params]
+        
+        # Add OAuth parameters if they don't exist
+        if 'oauth_client_id' not in param_names:
+            oauth_client_id_param = inspect.Parameter(
+                'oauth_client_id',
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                default=None,
+                annotation=Optional[str]
+            )
+            wrapper_params.append(oauth_client_id_param)
+        
+        if 'oauth_client_secret' not in param_names:
+            oauth_client_secret_param = inspect.Parameter(
+                'oauth_client_secret',
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                default=None,
+                annotation=Optional[str]
+            )
+            wrapper_params.append(oauth_client_secret_param)
+        
+        wrapper_sig = original_sig.replace(parameters=wrapper_params)
 
         @wraps(func)
         async def wrapper(*args, **kwargs):
-            # Note: `args` and `kwargs` are now the arguments for the *wrapper*,
-            # which does not include 'service'.
-
-            # Extract user_google_email from the arguments passed to the wrapper
+            # Extract OAuth credentials from kwargs
+            oauth_client_id = kwargs.get('oauth_client_id')
+            oauth_client_secret = kwargs.get('oauth_client_secret')
+            
+            # Bind arguments
             bound_args = wrapper_sig.bind(*args, **kwargs)
             bound_args.apply_defaults()
             user_google_email = bound_args.arguments.get('user_google_email')
+            
+            # Log OAuth credentials if provided
+            if oauth_client_id:
+                logger.debug(f"[Service Decorator] Using OAuth client_id: {oauth_client_id[:10]}... (truncated)")
+            else:
+                logger.debug("[Service Decorator] No OAuth client_id provided")
 
             if not user_google_email:
                 # This should ideally not be reached if 'user_google_email' is a required parameter
@@ -259,6 +291,8 @@ def require_google_service(
                         tool_name=tool_name,
                         user_google_email=user_google_email,
                         required_scopes=resolved_scopes,
+                        client_id=oauth_client_id,
+                        client_secret=oauth_client_secret,
                     )
                     if cache_enabled:
                         cache_key = _get_cache_key(user_google_email, service_name, service_version, resolved_scopes)
@@ -268,8 +302,13 @@ def require_google_service(
 
             # --- Call the original function with the service object injected ---
             try:
+                # Remove OAuth parameters before calling the original function
+                # since they were only needed for authentication
+                filtered_kwargs = {k: v for k, v in kwargs.items() 
+                                 if k not in ['oauth_client_id', 'oauth_client_secret']}
+                
                 # Prepend the fetched service object to the original arguments
-                return await func(service, *args, **kwargs)
+                return await func(service, *args, **filtered_kwargs)
             except RefreshError as e:
                 error_message = _handle_token_refresh_error(e, actual_user_email, service_name)
                 raise Exception(error_message)
@@ -300,13 +339,48 @@ def require_multiple_services(service_configs: List[Dict[str, Any]]):
             # Both services are automatically injected
     """
     def decorator(func: Callable) -> Callable:
+        # Get original function signature
+        original_sig = inspect.signature(func)
+        params = list(original_sig.parameters.values())
+        
+        # Create wrapper parameters with OAuth injection
+        wrapper_params = list(params)
+        param_names = [p.name for p in wrapper_params]
+        
+        # Add OAuth parameters if they don't exist
+        if 'oauth_client_id' not in param_names:
+            oauth_client_id_param = inspect.Parameter(
+                'oauth_client_id',
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                default=None,
+                annotation=Optional[str]
+            )
+            wrapper_params.append(oauth_client_id_param)
+        
+        if 'oauth_client_secret' not in param_names:
+            oauth_client_secret_param = inspect.Parameter(
+                'oauth_client_secret',
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                default=None,
+                annotation=Optional[str]
+            )
+            wrapper_params.append(oauth_client_secret_param)
+        
+        # Create new signature with OAuth parameters
+        wrapper_sig = original_sig.replace(parameters=wrapper_params)
+        
         @wraps(func)
         async def wrapper(*args, **kwargs):
+            # Extract OAuth credentials from kwargs
+            oauth_client_id = kwargs.get('oauth_client_id')
+            oauth_client_secret = kwargs.get('oauth_client_secret')
+            
             # Extract user_google_email
             sig = inspect.signature(func)
             param_names = list(sig.parameters.keys())
 
             user_google_email = None
+            
             if 'user_google_email' in kwargs:
                 user_google_email = kwargs['user_google_email']
             else:
@@ -343,6 +417,8 @@ def require_multiple_services(service_configs: List[Dict[str, Any]]):
                         tool_name=tool_name,
                         user_google_email=user_google_email,
                         required_scopes=resolved_scopes,
+                        client_id=oauth_client_id,
+                        client_secret=oauth_client_secret,
                     )
 
                     # Inject service with specified parameter name
@@ -353,12 +429,19 @@ def require_multiple_services(service_configs: List[Dict[str, Any]]):
 
             # Call the original function with refresh error handling
             try:
-                return await func(*args, **kwargs)
+                # Remove OAuth parameters before calling the original function
+                # since they were only needed for authentication
+                filtered_kwargs = {k: v for k, v in kwargs.items() 
+                                 if k not in ['oauth_client_id', 'oauth_client_secret']}
+                
+                return await func(*args, **filtered_kwargs)
             except RefreshError as e:
                 # Handle token refresh errors gracefully
                 error_message = _handle_token_refresh_error(e, user_google_email, "Multiple Services")
                 raise Exception(error_message)
 
+        # Set the wrapper's signature to include OAuth parameters
+        wrapper.__signature__ = wrapper_sig
         return wrapper
     return decorator
 

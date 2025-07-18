@@ -123,14 +123,25 @@ async def oauth2_callback(request: Request) -> HTMLResponse:
         return create_error_response(error_message)
 
     try:
-        # Check if we have credentials available (environment variables or file)
-        error_message = check_client_secrets()
-        if error_message:
-            return create_server_error_response(error_message)
-
         logger.info(f"OAuth callback: Received code (state: {state}). Attempting to exchange for tokens.")
 
-        mcp_session_id: Optional[str] = OAUTH_STATE_TO_SESSION_ID_MAP.pop(state, None)
+        # Get OAuth state info with Redis fallback
+        state_info = get_oauth_state(state)
+        client_id = None
+        client_secret = None
+        mcp_session_id = None
+        
+        if state_info:
+            mcp_session_id = state_info.session_id
+            client_id = state_info.client_id
+            client_secret = state_info.client_secret
+            logger.info(f"OAuth callback: Retrieved state info for state '{state}'.")
+        
+        # Check if we have credentials available (from state map, environment variables or file)
+        error_message = check_client_secrets(client_id, client_secret)
+        if error_message:
+            return create_server_error_response(error_message)
+            
         if mcp_session_id:
             logger.info(f"OAuth callback: Retrieved MCP session ID '{mcp_session_id}' for state '{state}'.")
         else:
@@ -142,7 +153,9 @@ async def oauth2_callback(request: Request) -> HTMLResponse:
             scopes=SCOPES, # Ensure all necessary scopes are requested
             authorization_response=str(request.url),
             redirect_uri=get_oauth_redirect_uri_for_current_mode(),
-            session_id=mcp_session_id # Pass session_id if available
+            session_id=mcp_session_id, # Pass session_id if available
+            client_id=client_id,
+            client_secret=client_secret
         )
 
         log_session_part = f" (linked to session: {mcp_session_id})" if mcp_session_id else ""
@@ -161,6 +174,8 @@ async def oauth2_callback(request: Request) -> HTMLResponse:
 async def start_google_auth(
     service_name: str,
     user_google_email: str = USER_GOOGLE_EMAIL,
+    oauth_client_id: Optional[str] = None,
+    oauth_client_secret: Optional[str] = None,
     mcp_session_id: Optional[str] = Header(None, alias="Mcp-Session-Id")
 ) -> str:
     """
@@ -184,6 +199,8 @@ async def start_google_auth(
         user_google_email (str): The user's full Google email address (e.g., 'example@gmail.com'). This is REQUIRED.
         service_name (str): The name of the Google service for which authentication is being requested (e.g., "Google Calendar", "Google Docs"). This is REQUIRED.
         mcp_session_id (Optional[str]): The active MCP session ID (automatically injected by FastMCP from the Mcp-Session-Id header). Links the OAuth flow state to the session.
+        oauth_client_id (Optional[str]): OAuth 2.0 client ID (overrides environment variable).
+        oauth_client_secret (Optional[str]): OAuth 2.0 client secret (overrides environment variable).
 
     Returns:
         str: A detailed message for the LLM with the authorization URL and instructions to guide the user through the authentication process.
@@ -199,6 +216,12 @@ async def start_google_auth(
         raise Exception(error_msg)
 
     logger.info(f"Tool 'start_google_auth' invoked for user_google_email: '{user_google_email}', service: '{service_name}', session: '{mcp_session_id}'.")
+    
+    # Log OAuth credentials if provided
+    if oauth_client_id:
+        logger.info(f"[start_google_auth] Using OAuth client_id: {oauth_client_id[:10]}... (truncated)")
+    else:
+        logger.info("[start_google_auth] No OAuth credentials provided, will use environment variables")
 
     # Ensure OAuth callback is available for current transport mode
     redirect_uri = get_oauth_redirect_uri_for_current_mode()
@@ -209,6 +232,8 @@ async def start_google_auth(
         mcp_session_id=mcp_session_id,
         user_google_email=user_google_email,
         service_name=service_name,
-        redirect_uri=redirect_uri
+        redirect_uri=redirect_uri,
+        client_id=oauth_client_id,
+        client_secret=oauth_client_secret
     )
     return auth_result

@@ -18,7 +18,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from auth.google_auth import handle_auth_callback, check_client_secrets
-from auth.scopes import OAUTH_STATE_TO_SESSION_ID_MAP, SCOPES
+from auth.scopes import OAUTH_STATE_TO_SESSION_ID_MAP, OAUTH_STATE_TO_SESSION_INFO_MAP, SCOPES, get_oauth_state
 from auth.oauth_responses import create_error_response, create_success_response, create_server_error_response
 
 logger = logging.getLogger(__name__)
@@ -61,14 +61,25 @@ class MinimalOAuthServer:
                 return create_error_response(error_message)
 
             try:
-                # Check if we have credentials available (environment variables or file)
-                error_message = check_client_secrets()
-                if error_message:
-                    return create_server_error_response(error_message)
-
                 logger.info(f"OAuth callback: Received code (state: {state}). Attempting to exchange for tokens.")
 
-                mcp_session_id: Optional[str] = OAUTH_STATE_TO_SESSION_ID_MAP.pop(state, None)
+                # Get OAuth state info with Redis fallback
+                state_info = get_oauth_state(state)
+                client_id = None
+                client_secret = None
+                mcp_session_id = None
+                
+                if state_info:
+                    mcp_session_id = state_info.session_id
+                    client_id = state_info.client_id
+                    client_secret = state_info.client_secret
+                    logger.info(f"OAuth callback: Retrieved state info for state '{state}'.")
+                
+                # Check if we have credentials available (from state map, environment variables or file)
+                error_message = check_client_secrets(client_id, client_secret)
+                if error_message:
+                    return create_server_error_response(error_message)
+                    
                 if mcp_session_id:
                     logger.info(f"OAuth callback: Retrieved MCP session ID '{mcp_session_id}' for state '{state}'.")
                 else:
@@ -80,7 +91,9 @@ class MinimalOAuthServer:
                     scopes=SCOPES,
                     authorization_response=str(request.url),
                     redirect_uri=redirect_uri,
-                    session_id=mcp_session_id
+                    session_id=mcp_session_id,
+                    client_id=client_id,
+                    client_secret=client_secret
                 )
 
                 log_session_part = f" (linked to session: {mcp_session_id})" if mcp_session_id else ""
@@ -203,7 +216,11 @@ def get_oauth_redirect_uri(port: int = 8000, base_uri: str = "http://localhost")
         return env_redirect_uri
 
     # Fallback to constructing the URI based on server settings
-    constructed_uri = f"{base_uri}:{port}/oauth2callback"
+    # Don't add port for standard HTTPS (443) or HTTP (80) ports
+    if (base_uri.startswith("https://") and port == 443) or (base_uri.startswith("http://") and port == 80):
+        constructed_uri = f"{base_uri}/oauth2callback"
+    else:
+        constructed_uri = f"{base_uri}:{port}/oauth2callback"
     logger.info(f"Constructed redirect URI: {constructed_uri}")
     return constructed_uri
 

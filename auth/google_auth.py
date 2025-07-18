@@ -15,7 +15,8 @@ from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from auth.scopes import OAUTH_STATE_TO_SESSION_ID_MAP, SCOPES
+from auth.scopes import SCOPES, store_oauth_state
+from auth.redis_state_store import get_redis_store
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -41,8 +42,6 @@ def get_default_credentials_dir():
 DEFAULT_CREDENTIALS_DIR = get_default_credentials_dir()
 
 # In-memory cache for session credentials, maps session_id to Credentials object
-# This is brittle and bad, but our options are limited with Claude in present state.
-# This should be more robust in a production system once OAuth2.1 is implemented in client.
 _SESSION_CREDENTIALS_CACHE: Dict[str, Credentials] = {}
 # Centralized Client Secrets Path Logic
 _client_secrets_env = os.getenv("GOOGLE_CLIENT_SECRET_PATH") or os.getenv(
@@ -116,8 +115,11 @@ def save_credentials_to_file(
     credentials: Credentials,
     base_dir: str = DEFAULT_CREDENTIALS_DIR,
 ):
-    """Saves user credentials to a file."""
-    creds_path = _get_user_credential_path(user_google_email, base_dir)
+    """Saves user credentials to Redis (replaces file storage)."""
+    if not credentials.client_id:
+        logger.error(f"Cannot save credentials for {user_google_email}: missing client_id")
+        return
+        
     creds_data = {
         "token": credentials.token,
         "refresh_token": credentials.refresh_token,
@@ -127,37 +129,61 @@ def save_credentials_to_file(
         "scopes": credentials.scopes,
         "expiry": credentials.expiry.isoformat() if credentials.expiry else None,
     }
-    try:
-        with open(creds_path, "w") as f:
-            json.dump(creds_data, f)
-        logger.info(f"Credentials saved for user {user_google_email} to {creds_path}")
-    except IOError as e:
-        logger.error(
-            f"Error saving credentials for user {user_google_email} to {creds_path}: {e}"
-        )
-        raise
+    
+    redis_store = get_redis_store()
+    if redis_store.store_user_credentials(
+        user_google_email, 
+        credentials.client_id, 
+        json.dumps(creds_data)
+    ):
+        logger.info(f"Credentials saved for user {user_google_email} to Redis")
+    else:
+        logger.error(f"Failed to save credentials for user {user_google_email} to Redis")
 
 
 def save_credentials_to_session(session_id: str, credentials: Credentials):
-    """Saves user credentials to the in-memory session cache."""
-    _SESSION_CREDENTIALS_CACHE[session_id] = credentials
-    logger.debug(f"Credentials saved to session cache for session_id: {session_id}")
+    """Saves user credentials to Redis session cache."""
+    creds_data = {
+        "token": credentials.token,
+        "refresh_token": credentials.refresh_token,
+        "token_uri": credentials.token_uri,
+        "client_id": credentials.client_id,
+        "client_secret": credentials.client_secret,
+        "scopes": credentials.scopes,
+        "expiry": credentials.expiry.isoformat() if credentials.expiry else None,
+    }
+    
+    redis_store = get_redis_store()
+    if redis_store.store_session_credentials(session_id, json.dumps(creds_data)):
+        logger.debug(f"Credentials saved to Redis session cache for session_id: {session_id}")
+    else:
+        # Fallback to in-memory cache
+        _SESSION_CREDENTIALS_CACHE[session_id] = credentials
+        logger.debug(f"Credentials saved to in-memory cache for session_id: {session_id}")
 
 
 def load_credentials_from_file(
-    user_google_email: str, base_dir: str = DEFAULT_CREDENTIALS_DIR
+    user_google_email: str, base_dir: str = DEFAULT_CREDENTIALS_DIR, 
+    client_id: Optional[str] = None
 ) -> Optional[Credentials]:
-    """Loads user credentials from a file."""
-    creds_path = _get_user_credential_path(user_google_email, base_dir)
-    if not os.path.exists(creds_path):
+    """Loads user credentials from Redis (replaces file storage)."""
+    if not client_id:
         logger.info(
-            f"No credentials file found for user {user_google_email} at {creds_path}"
+            f"Cannot load credentials for {user_google_email}: no client_id provided"
+        )
+        return None
+        
+    redis_store = get_redis_store()
+    creds_json = redis_store.get_user_credentials(user_google_email, client_id)
+    
+    if not creds_json:
+        logger.info(
+            f"No credentials found for user {user_google_email} in Redis"
         )
         return None
 
     try:
-        with open(creds_path, "r") as f:
-            creds_data = json.load(f)
+        creds_data = json.loads(creds_json)
 
         # Parse expiry if present
         expiry = None
@@ -179,91 +205,149 @@ def load_credentials_from_file(
             expiry=expiry,
         )
         logger.debug(
-            f"Credentials loaded for user {user_google_email} from {creds_path}"
+            f"Credentials loaded for user {user_google_email} from Redis"
         )
         return credentials
-    except (IOError, json.JSONDecodeError, KeyError) as e:
+    except (json.JSONDecodeError, KeyError) as e:
         logger.error(
-            f"Error loading or parsing credentials for user {user_google_email} from {creds_path}: {e}"
+            f"Error parsing credentials for user {user_google_email}: {e}"
         )
         return None
 
 
 def load_credentials_from_session(session_id: str) -> Optional[Credentials]:
-    """Loads user credentials from the in-memory session cache."""
+    """Loads user credentials from Redis session cache."""
+    # Try Redis first
+    redis_store = get_redis_store()
+    creds_json = redis_store.get_session_credentials(session_id)
+    
+    if creds_json:
+        try:
+            creds_data = json.loads(creds_json)
+            
+            # Parse expiry if present
+            expiry = None
+            if creds_data.get("expiry"):
+                try:
+                    expiry = datetime.fromisoformat(creds_data["expiry"])
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"Could not parse expiry time: {e}")
+            
+            credentials = Credentials(
+                token=creds_data.get("token"),
+                refresh_token=creds_data.get("refresh_token"),
+                token_uri=creds_data.get("token_uri"),
+                client_id=creds_data.get("client_id"),
+                client_secret=creds_data.get("client_secret"),
+                scopes=creds_data.get("scopes"),
+                expiry=expiry,
+            )
+            logger.debug(
+                f"Credentials loaded from Redis session cache for session_id: {session_id}"
+            )
+            return credentials
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.error(f"Error parsing session credentials: {e}")
+    
+    # Fallback to in-memory cache
     credentials = _SESSION_CREDENTIALS_CACHE.get(session_id)
     if credentials:
         logger.debug(
-            f"Credentials loaded from session cache for session_id: {session_id}"
+            f"Credentials loaded from in-memory cache for session_id: {session_id}"
         )
     else:
         logger.debug(
-            f"No credentials found in session cache for session_id: {session_id}"
+            f"No credentials found for session_id: {session_id}"
         )
     return credentials
 
 
-def load_client_secrets_from_env() -> Optional[Dict[str, Any]]:
+def load_client_secrets_from_env(
+    client_id: Optional[str] = None,
+    client_secret: Optional[str] = None,
+    redirect_uri: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
     """
-    Loads the client secrets from environment variables.
+    Loads the client secrets from provided parameters or environment variables.
 
-    Environment variables used:
+    Args:
+        client_id: OAuth 2.0 client ID (overrides environment variable)
+        client_secret: OAuth 2.0 client secret (overrides environment variable)
+        redirect_uri: OAuth redirect URI (overrides environment variable)
+
+    Environment variables used (as fallback):
         - GOOGLE_OAUTH_CLIENT_ID: OAuth 2.0 client ID
         - GOOGLE_OAUTH_CLIENT_SECRET: OAuth 2.0 client secret
         - GOOGLE_OAUTH_REDIRECT_URI: (optional) OAuth redirect URI
 
     Returns:
         Client secrets configuration dict compatible with Google OAuth library,
-        or None if required environment variables are not set.
+        or None if required credentials are not available.
     """
-    client_id = os.getenv("GOOGLE_OAUTH_CLIENT_ID")
-    client_secret = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET")
-    redirect_uri = os.getenv("GOOGLE_OAUTH_REDIRECT_URI")
+    # Log if credentials are provided via parameters
+    if client_id:
+        logger.info(f"[OAuth] Using provided client_id: {client_id[:10]}... (truncated for security)")
+    if client_secret:
+        logger.info(f"[OAuth] Using provided client_secret: ****** (hidden for security)")
+    
+    # Use provided parameters first, fall back to environment variables
+    final_client_id = client_id or os.getenv("GOOGLE_OAUTH_CLIENT_ID")
+    final_client_secret = client_secret or os.getenv("GOOGLE_OAUTH_CLIENT_SECRET")
+    final_redirect_uri = redirect_uri or os.getenv("GOOGLE_OAUTH_REDIRECT_URI")
 
-    if client_id and client_secret:
+    if final_client_id and final_client_secret:
         # Create config structure that matches Google client secrets format
         web_config = {
-            "client_id": client_id,
-            "client_secret": client_secret,
+            "client_id": final_client_id,
+            "client_secret": final_client_secret,
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
             "token_uri": "https://oauth2.googleapis.com/token",
             "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
         }
 
-        # Add redirect_uri if provided via environment variable
-        if redirect_uri:
-            web_config["redirect_uris"] = [redirect_uri]
+        # Add redirect_uri if provided
+        if final_redirect_uri:
+            web_config["redirect_uris"] = [final_redirect_uri]
 
         # Return the full config structure expected by Google OAuth library
         config = {"web": web_config}
 
-        logger.info("Loaded OAuth client credentials from environment variables")
+        logger.info("Loaded OAuth client credentials")
         return config
 
-    logger.debug("OAuth client credentials not found in environment variables")
+    logger.debug("OAuth client credentials not available")
     return None
 
 
-def load_client_secrets(client_secrets_path: str) -> Dict[str, Any]:
+def load_client_secrets(
+    client_secrets_path: str,
+    client_id: Optional[str] = None,
+    client_secret: Optional[str] = None,
+    redirect_uri: Optional[str] = None
+) -> Dict[str, Any]:
     """
-    Loads the client secrets from environment variables (preferred) or from the client secrets file.
+    Loads the client secrets from provided parameters, environment variables, or file.
 
     Priority order:
-    1. Environment variables (GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET)
-    2. File-based credentials at the specified path
+    1. Provided parameters (client_id, client_secret)
+    2. Environment variables (GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET)
+    3. File-based credentials at the specified path
 
     Args:
         client_secrets_path: Path to the client secrets JSON file (used as fallback)
+        client_id: OAuth 2.0 client ID (overrides environment variable)
+        client_secret: OAuth 2.0 client secret (overrides environment variable)
+        redirect_uri: OAuth redirect URI (overrides environment variable)
 
     Returns:
         Client secrets configuration dict
 
     Raises:
         ValueError: If client secrets file has invalid format
-        IOError: If file cannot be read and no environment variables are set
+        IOError: If file cannot be read and no credentials are provided
     """
-    # First, try to load from environment variables
-    env_config = load_client_secrets_from_env()
+    # First, try to load from provided parameters or environment variables
+    env_config = load_client_secrets_from_env(client_id, client_secret, redirect_uri)
     if env_config:
         # Extract the "web" config from the environment structure
         return env_config["web"]
@@ -293,41 +377,64 @@ def load_client_secrets(client_secrets_path: str) -> Dict[str, Any]:
         raise
 
 
-def check_client_secrets() -> Optional[str]:
+def check_client_secrets(
+    client_id: Optional[str] = None,
+    client_secret: Optional[str] = None
+) -> Optional[str]:
     """
-    Checks for the presence of OAuth client secrets, either as environment
-    variables or as a file.
+    Checks for the presence of OAuth client secrets in provided parameters,
+    environment variables, or as a file.
+
+    Args:
+        client_id: OAuth 2.0 client ID (overrides environment variable)
+        client_secret: OAuth 2.0 client secret (overrides environment variable)
 
     Returns:
         An error message string if secrets are not found, otherwise None.
     """
-    env_config = load_client_secrets_from_env()
+    env_config = load_client_secrets_from_env(client_id, client_secret)
     if not env_config and not os.path.exists(CONFIG_CLIENT_SECRETS_PATH):
         logger.error(
-            f"OAuth client credentials not found. No environment variables set and no file at {CONFIG_CLIENT_SECRETS_PATH}"
+            f"OAuth client credentials not found. No credentials provided, no environment variables set and no file at {CONFIG_CLIENT_SECRETS_PATH}"
         )
-        return f"OAuth client credentials not found. Please set GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET environment variables or provide a client secrets file at {CONFIG_CLIENT_SECRETS_PATH}."
+        return f"OAuth client credentials not found. Please provide client_id and client_secret parameters, set GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET environment variables, or provide a client secrets file at {CONFIG_CLIENT_SECRETS_PATH}."
     return None
 
 
 def create_oauth_flow(
-    scopes: List[str], redirect_uri: str, state: Optional[str] = None
+    scopes: List[str], 
+    redirect_uri: str, 
+    state: Optional[str] = None,
+    client_id: Optional[str] = None,
+    client_secret: Optional[str] = None
 ) -> Flow:
-    """Creates an OAuth flow using environment variables or client secrets file."""
-    # Try environment variables first
-    env_config = load_client_secrets_from_env()
+    """
+    Creates an OAuth flow using provided credentials, environment variables, or client secrets file.
+    
+    Args:
+        scopes: List of OAuth scopes
+        redirect_uri: OAuth redirect URI
+        state: Optional state parameter for OAuth flow
+        client_id: OAuth 2.0 client ID (overrides environment variable)
+        client_secret: OAuth 2.0 client secret (overrides environment variable)
+    
+    Returns:
+        Configured OAuth Flow object
+    """
+    # Try provided credentials or environment variables first
+    env_config = load_client_secrets_from_env(client_id, client_secret, redirect_uri)
     if env_config:
         # Use client config directly
         flow = Flow.from_client_config(
             env_config, scopes=scopes, redirect_uri=redirect_uri, state=state
         )
-        logger.debug("Created OAuth flow from environment variables")
+        logger.debug("Created OAuth flow from provided credentials or environment variables")
         return flow
 
     # Fall back to file-based config
     if not os.path.exists(CONFIG_CLIENT_SECRETS_PATH):
         raise FileNotFoundError(
-            f"OAuth client secrets file not found at {CONFIG_CLIENT_SECRETS_PATH} and no environment variables set"
+            f"OAuth client secrets file not found at {CONFIG_CLIENT_SECRETS_PATH} and no credentials provided"
         )
 
     flow = Flow.from_client_secrets_file(
@@ -350,6 +457,8 @@ async def start_auth_flow(
     user_google_email: Optional[str],
     service_name: str,  # e.g., "Google Calendar", "Gmail" for user messages
     redirect_uri: str,  # Added redirect_uri as a required parameter
+    client_id: Optional[str] = None,
+    client_secret: Optional[str] = None,
 ) -> str:
     """
     Initiates the Google OAuth flow and returns an actionable message for the user.
@@ -359,6 +468,8 @@ async def start_auth_flow(
         user_google_email: The user's specified Google email, if provided.
         service_name: The name of the Google service requiring auth (for user messages).
         redirect_uri: The URI Google will redirect to after authorization.
+        client_id: OAuth 2.0 client ID (overrides environment variable)
+        client_secret: OAuth 2.0 client secret (overrides environment variable)
 
     Returns:
         A formatted string containing guidance for the LLM/user.
@@ -391,16 +502,19 @@ async def start_auth_flow(
             os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
         oauth_state = os.urandom(16).hex()
-        if mcp_session_id:
-            OAUTH_STATE_TO_SESSION_ID_MAP[oauth_state] = mcp_session_id
-            logger.info(
-                f"[start_auth_flow] Stored mcp_session_id '{mcp_session_id}' for oauth_state '{oauth_state}'."
-            )
+        
+        # Store OAuth state with Redis fallback
+        store_oauth_state(oauth_state, mcp_session_id, client_id, client_secret)
+        logger.info(
+            f"[start_auth_flow] Stored OAuth state '{oauth_state}' with session_id '{mcp_session_id}'"
+        )
 
         flow = create_oauth_flow(
             scopes=SCOPES,  # Use global SCOPES
             redirect_uri=redirect_uri,  # Use passed redirect_uri
             state=oauth_state,
+            client_id=client_id,
+            client_secret=client_secret,
         )
 
         auth_url, _ = flow.authorization_url(access_type="offline", prompt="consent")
@@ -463,6 +577,8 @@ def handle_auth_callback(
     client_secrets_path: Optional[
         str
     ] = None,  # Deprecated: kept for backward compatibility
+    client_id: Optional[str] = None,
+    client_secret: Optional[str] = None,
 ) -> Tuple[str, Credentials]:
     """
     Handles the callback from Google, exchanges the code for credentials,
@@ -476,6 +592,8 @@ def handle_auth_callback(
         credentials_base_dir: Base directory for credential files.
         session_id: Optional MCP session ID to associate with the credentials.
         client_secrets_path: (Deprecated) Path to client secrets file. Ignored if environment variables are set.
+        client_id: OAuth 2.0 client ID (overrides environment variable)
+        client_secret: OAuth 2.0 client secret (overrides environment variable)
 
     Returns:
         A tuple containing the user_google_email and the obtained Credentials object.
@@ -499,7 +617,12 @@ def handle_auth_callback(
             )
             os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
-        flow = create_oauth_flow(scopes=scopes, redirect_uri=redirect_uri)
+        flow = create_oauth_flow(
+            scopes=scopes, 
+            redirect_uri=redirect_uri,
+            client_id=client_id,
+            client_secret=client_secret
+        )
 
         # Exchange the authorization code for credentials
         # Note: fetch_token will use the redirect_uri configured in the flow
@@ -536,6 +659,8 @@ def get_credentials(
     client_secrets_path: Optional[str] = None,
     credentials_base_dir: str = DEFAULT_CREDENTIALS_DIR,
     session_id: Optional[str] = None,
+    provided_client_id: Optional[str] = None,
+    provided_client_secret: Optional[str] = None,
 ) -> Optional[Credentials]:
     """
     Retrieves stored credentials, prioritizing session, then file. Refreshes if necessary.
@@ -548,6 +673,8 @@ def get_credentials(
         client_secrets_path: Path to client secrets, required for refresh if not in creds.
         credentials_base_dir: Base directory for credential files.
         session_id: Optional MCP session ID.
+        provided_client_id: OAuth client ID provided by the tenant.
+        provided_client_secret: OAuth client secret provided by the tenant.
 
     Returns:
         Valid Credentials object or None.
@@ -596,20 +723,20 @@ def get_credentials(
                     f"[get_credentials] Loaded credentials from session for session_id '{session_id}'."
                 )
 
-        if not credentials and user_google_email:
-            logger.debug(
-                f"[get_credentials] No session credentials, trying file for user_google_email '{user_google_email}'."
-            )
+        # MULTI-TENANT MODE: Try loading from Redis if we have client_id
+        if not credentials and user_google_email and provided_client_id:
             credentials = load_credentials_from_file(
-                user_google_email, credentials_base_dir
+                user_google_email, 
+                credentials_base_dir, 
+                provided_client_id
             )
-            if credentials and session_id:
-                logger.debug(
-                    f"[get_credentials] Loaded from file for user '{user_google_email}', caching to session '{session_id}'."
+            if credentials:
+                logger.info(
+                    f"[get_credentials] Loaded credentials from Redis for user '{user_google_email}'"
                 )
-                save_credentials_to_session(
-                    session_id, credentials
-                )  # Cache for current session
+                # Cache in session if we have a session_id
+                if session_id:
+                    save_credentials_to_session(session_id, credentials)
 
         if not credentials:
             logger.info(
@@ -720,6 +847,8 @@ async def get_authenticated_google_service(
     tool_name: str,  # For logging/debugging
     user_google_email: str,  # Required - no more Optional
     required_scopes: List[str],
+    client_id: Optional[str] = None,
+    client_secret: Optional[str] = None,
 ) -> tuple[Any, str]:
     """
     Centralized Google service authentication for all MCP tools.
@@ -731,6 +860,8 @@ async def get_authenticated_google_service(
         tool_name: The name of the calling tool (for logging/debugging)
         user_google_email: The user's Google email address (required)
         required_scopes: List of required OAuth scopes
+        client_id: OAuth 2.0 client ID (overrides environment variable)
+        client_secret: OAuth 2.0 client secret (overrides environment variable)
 
     Returns:
         tuple[service, user_email] on success
@@ -741,6 +872,12 @@ async def get_authenticated_google_service(
     logger.info(
         f"[{tool_name}] Attempting to get authenticated {service_name} service. Email: '{user_google_email}'"
     )
+    
+    # Log OAuth credentials if provided
+    if client_id:
+        logger.info(f"[{tool_name}] Using OAuth client_id: {client_id[:10]}... (truncated)")
+    else:
+        logger.info(f"[{tool_name}] No OAuth credentials provided, will use environment variables or file")
 
     # Validate email format
     if not user_google_email or "@" not in user_google_email:
@@ -754,6 +891,8 @@ async def get_authenticated_google_service(
         required_scopes=required_scopes,
         client_secrets_path=CONFIG_CLIENT_SECRETS_PATH,
         session_id=None,  # Session ID not available in service layer
+        provided_client_id=client_id,
+        provided_client_secret=client_secret,
     )
 
     if not credentials or not credentials.valid:
@@ -777,6 +916,8 @@ async def get_authenticated_google_service(
             user_google_email=user_google_email,
             service_name=f"Google {service_name.title()}",
             redirect_uri=redirect_uri,
+            client_id=client_id,
+            client_secret=client_secret,
         )
 
         # Extract the auth URL from the response and raise with it

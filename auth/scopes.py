@@ -5,13 +5,30 @@ This module centralizes OAuth scope definitions for Google Workspace integration
 Separated from service_decorator.py to avoid circular imports.
 """
 import logging
-from typing import Dict
+from typing import Dict, Optional, NamedTuple
 
 logger = logging.getLogger(__name__)
 
-# Temporary map to associate OAuth state with MCP session ID
+# OAuth state info structure
+class OAuthStateInfo(NamedTuple):
+    session_id: Optional[str]
+    client_id: Optional[str]
+    client_secret: Optional[str]
+
+# Temporary map to associate OAuth state with session info and credentials
 # This should ideally be a more robust cache in a production system (e.g., Redis)
+OAUTH_STATE_TO_SESSION_INFO_MAP: Dict[str, OAuthStateInfo] = {}
+
+# Legacy map for backward compatibility
 OAUTH_STATE_TO_SESSION_ID_MAP: Dict[str, str] = {}
+
+# Import Redis store functions
+try:
+    from auth.redis_state_store import get_redis_store
+    _redis_available = True
+except ImportError:
+    logger.warning("Redis state store not available, using in-memory storage only")
+    _redis_available = False
 
 # Individual OAuth Scope Constants
 USERINFO_EMAIL_SCOPE = 'https://www.googleapis.com/auth/userinfo.email'
@@ -115,3 +132,76 @@ TASKS_SCOPES = [
 
 # Combined scopes for all supported Google Workspace operations
 SCOPES = list(set(BASE_SCOPES + CALENDAR_SCOPES + DRIVE_SCOPES + GMAIL_SCOPES + DOCS_SCOPES + CHAT_SCOPES + SHEETS_SCOPES + FORMS_SCOPES + SLIDES_SCOPES + TASKS_SCOPES))
+
+
+# Helper functions for state management with Redis fallback
+def store_oauth_state(state: str, session_id: Optional[str], 
+                     client_id: Optional[str], client_secret: Optional[str]) -> None:
+    """
+    Store OAuth state with Redis fallback to in-memory.
+    
+    Args:
+        state: OAuth state parameter
+        session_id: MCP session ID
+        client_id: OAuth client ID
+        client_secret: OAuth client secret
+    """
+    # Try Redis first
+    if _redis_available:
+        try:
+            redis_store = get_redis_store()
+            if redis_store.store_oauth_state(state, session_id, client_id, client_secret):
+                logger.debug(f"Stored OAuth state in Redis: {state}")
+                return
+        except Exception as e:
+            logger.warning(f"Failed to store in Redis, falling back to memory: {e}")
+    
+    # Fallback to in-memory
+    state_info = OAuthStateInfo(session_id=session_id, client_id=client_id, client_secret=client_secret)
+    OAUTH_STATE_TO_SESSION_INFO_MAP[state] = state_info
+    
+    # Also update legacy map for backward compatibility
+    if session_id:
+        OAUTH_STATE_TO_SESSION_ID_MAP[state] = session_id
+    
+    logger.debug(f"Stored OAuth state in memory: {state}")
+
+
+def get_oauth_state(state: str) -> Optional[OAuthStateInfo]:
+    """
+    Retrieve OAuth state with Redis fallback to in-memory.
+    
+    Args:
+        state: OAuth state parameter
+        
+    Returns:
+        OAuthStateInfo or None
+    """
+    # Try Redis first
+    if _redis_available:
+        try:
+            redis_store = get_redis_store()
+            data = redis_store.get_oauth_state(state)
+            if data:
+                logger.debug(f"Retrieved OAuth state from Redis: {state}")
+                return OAuthStateInfo(
+                    session_id=data.get("session_id"),
+                    client_id=data.get("client_id"),
+                    client_secret=data.get("client_secret")
+                )
+        except Exception as e:
+            logger.warning(f"Failed to retrieve from Redis, falling back to memory: {e}")
+    
+    # Try in-memory map
+    state_info = OAUTH_STATE_TO_SESSION_INFO_MAP.pop(state, None)
+    if state_info:
+        logger.debug(f"Retrieved OAuth state from memory: {state}")
+        return state_info
+    
+    # Try legacy map as last resort
+    session_id = OAUTH_STATE_TO_SESSION_ID_MAP.pop(state, None)
+    if session_id:
+        logger.debug(f"Retrieved session ID from legacy map: {state}")
+        return OAuthStateInfo(session_id=session_id, client_id=None, client_secret=None)
+    
+    return None
